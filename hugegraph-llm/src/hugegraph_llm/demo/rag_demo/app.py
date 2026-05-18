@@ -157,7 +157,7 @@ def init_rag_ui() -> gr.Interface:
 
 def create_app():
     app = FastAPI(lifespan=lifespan)
-    # we don't need to manually check the env now
+    # we don't need to manually check the .env now
     # settings.check_env()
     prompt.update_yaml_file()
     auth_enabled = admin_settings.enable_login.lower() == "true"
@@ -202,5 +202,5 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         factory=True,
-        reload=True,
+        reload=False,
     )

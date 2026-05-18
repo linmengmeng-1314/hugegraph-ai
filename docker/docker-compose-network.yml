@@ -49,3 +49,31 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+  # HugeGraph management and analysis platform Service
+  hugegraph-hubble:
+    image: hugegraph/hubble
+    container_name: hubble
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      # Mount .env file, please modify according to actual path
+      - ${PROJECT_PATH}/hugegraph-llm/.env:/home/work/hugegraph-llm/.env
+      # Optional: mount resources file
+      # - ${PROJECT_PATH}/hugegraph-llm/src/hugegraph_llm/resources:/home/work/hugegraph-llm/src/hugegraph_llm/resources
+    networks:
+      - hugegraph-network
+    environment:
+      # Set HugeGraph server address, use container name as hostname
+      - HUGEGRAPH_HOST=server
+      - HUGEGRAPH_PORT=8080
+    depends_on:
+      hugegraph-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
