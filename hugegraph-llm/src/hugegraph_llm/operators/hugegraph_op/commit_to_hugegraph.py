@@ -75,13 +75,15 @@ class Commit2Graph:
         except CreateError as e:
             log.error("Error on creating: %s, %s", args, e)
             return None
+        except Exception as e:
+            log.error("Unexpected error on creating: %s, %s", args, e)
+            return None
 
     def load_into_graph(self, vertices, edges, schema):  # pylint: disable=too-many-statements
         # pylint: disable=R0912 (too-many-branches)
         vertex_label_map = {v_label["name"]: v_label for v_label in schema["vertexlabels"]}
         edge_label_map = {e_label["name"]: e_label for e_label in schema["edgelabels"]}
         property_label_map = {p_label["name"]: p_label for p_label in schema["propertykeys"]}
-        vid_mapping = {}  # mapping from LLM-generated vertex ID to actual server vertex ID
 
         for vertex in vertices:
             input_label = vertex["label"]
@@ -148,25 +150,27 @@ class Commit2Graph:
 
             # TODO: we could try batch add vertices first, setback to single-mode if failed
             original_id = vertex.get("id")
-            if vertex_label.get("id_strategy") == "CUSTOMIZE_STRING" and original_id:
-                result = self._handle_graph_creation(
-                    self.client.graph().addVertex,
-                    input_label,
-                    input_properties,
-                    id=original_id,
-                )
-            else:
-                result = self._handle_graph_creation(self.client.graph().addVertex, input_label, input_properties)
-            vid = result.id
+            vid = self._handle_graph_creation(self.client.graph().addVertex, input_label, input_properties).id
             vertex["id"] = vid
+            # Preserve original composite ID for edge lookup — on some backends (e.g. HBase),
+            # addVertex returns a different ID than the composite "label:pk_value" format,
+            # but edges still reference the original composite ID from extraction
+            if original_id and str(original_id) != str(vid):
+                vertex["_original_id"] = str(original_id)
+
+        # Build vertex lookup: composite_id -> (label, pk_name, pk_value)
+        vertex_lookup = self._build_vertex_lookup(vertices, vertex_label_map)
+
+        # Build vid_mapping: LLM-generated/original ID -> server-returned ID
+        vid_mapping = {}
+        for vertex in vertices:
+            vid = str(vertex.get("id", ""))
+            original_id = vertex.get("_original_id")
             if original_id:
-                vid_mapping[original_id] = vid
+                vid_mapping[str(original_id)] = vid
 
         for edge in edges:
-            start = vid_mapping.get(edge.get("outV"), edge.get("outV"))
-            end = vid_mapping.get(edge.get("inV"), edge.get("inV"))
             label = edge["label"]
-            properties = edge["properties"]
 
             if label not in edge_label_map:
                 log.critical(
@@ -175,8 +179,111 @@ class Commit2Graph:
                 )
                 continue
 
-            # TODO: we could try batch add edges first, setback to single-mode if failed
-            self._handle_graph_creation(self.client.graph().addEdge, label, start, end, properties)
+            self._create_edge(edge, vertex_lookup, edge_label_map, vertex_label_map, vid_mapping)
+
+    def _build_vertex_lookup(self, vertices, vertex_label_map):
+        """Build a lookup from composite vertex IDs to (label, pk_name, pk_value).
+
+        Used for edge creation via Gremlin to avoid relying on vertex IDs,
+        which may not match the actual stored IDs on some backends (e.g. HBase).
+        """
+        label_pks = {}
+        for vlabel_name, vlabel in vertex_label_map.items():
+            pks = vlabel.get("primary_keys", [])
+            if pks:
+                label_pks[vlabel_name] = pks[0]
+
+        if not label_pks:
+            return {}
+
+        lookup = {}
+        for vertex in vertices:
+            vid = vertex.get("id")
+            if not vid:
+                continue
+            label = vertex["label"]
+            pk_name = label_pks.get(label)
+            if not pk_name:
+                continue
+            pk_value = vertex.get("properties", {}).get(pk_name)
+            if pk_value is None:
+                continue
+            entry = (label, pk_name, str(pk_value))
+            lookup[str(vid)] = entry
+            # Also index by the original composite ID from extraction,
+            # so edges can find vertices even when the backend returns different IDs
+            original_id = vertex.get("_original_id")
+            if original_id:
+                lookup[original_id] = entry
+        return lookup
+
+    def _create_edge(self, edge, vertex_lookup, edge_label_map, vertex_label_map, vid_mapping):
+        """Create an edge, preferring REST API with translated IDs, falling back to Gremlin."""
+        label = edge["label"]
+        properties = edge.get("properties", {})
+        source_label = edge_label_map[label]["source_label"]
+        target_label = edge_label_map[label]["target_label"]
+
+        outV_id = str(edge["outV"])
+        inV_id = str(edge["inV"])
+
+        # Translate LLM-generated vertex IDs to server-returned IDs
+        outV_server = vid_mapping.get(outV_id, outV_id)
+        inV_server = vid_mapping.get(inV_id, inV_id)
+
+        # Try REST API first (works when serializer=hbase)
+        result = self._handle_graph_creation(self.client.graph().addEdge, label, outV_server, inV_server, properties)
+        if result is not None:
+            return
+
+        # Fallback: try Gremlin-based edge creation if we have primary key info
+        log.warning("REST API addEdge failed for %s %s->%s, trying Gremlin fallback", label, outV_id, inV_id)
+        out_info = vertex_lookup.get(outV_id)
+        in_info = vertex_lookup.get(inV_id)
+
+        if out_info and in_info:
+            self._create_edge_via_gremlin(label, properties, out_info, in_info, source_label, target_label)
+
+    def _create_edge_via_gremlin(self, edge_label, properties, out_info, in_info, source_label, target_label):
+        """Create an edge using Gremlin with vertex lookup by primary key.
+
+        This avoids the ID mismatch issue on backends like HBase where
+        addVertex returns a composite ID that doesn't match the stored ID.
+        """
+        _, out_pk_name, out_pk_value = out_info
+        _, in_pk_name, in_pk_value = in_info
+
+        # Build property clauses
+        prop_clauses = ""
+        for key, value in properties.items():
+            if isinstance(value, str):
+                prop_clauses += f".property('{key}','{value}')"
+            else:
+                prop_clauses += f".property('{key}',{value})"
+
+        groovy = (
+            f"g.V().hasLabel('{source_label}').has('{out_pk_name}','{out_pk_value}')"
+            f".addE('{edge_label}')"
+            f".to(__.V().hasLabel('{target_label}').has('{in_pk_name}','{in_pk_value}'))"
+            f"{prop_clauses}"
+        )
+
+        try:
+            self.client.gremlin().exec(groovy)
+            log.info(
+                "Edge created via Gremlin: %s %s->%s",
+                edge_label,
+                out_pk_value,
+                in_pk_value,
+            )
+        except (CreateError, NotFoundError) as e:
+            log.error(
+                "Failed to create edge %s %s->%s via Gremlin: %s",
+                edge_label,
+                out_pk_value,
+                in_pk_value,
+                e,
+            )
 
     def init_schema_if_need(self, schema: dict):
         properties = schema["propertykeys"]

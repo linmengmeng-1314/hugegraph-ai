@@ -10,6 +10,11 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    volumes:
+      - /Users/onlyone/Documents/volumes/hugegraph/conf/log4j2.xml:/hugegraph-server/conf/log4j2.xml:ro
+      - /Users/onlyone/Documents/volumes/hugegraph/conf/graphs:/hugegraph-server/conf/graphs:ro
+    extra_hosts:
+      - "hbase:192.168.104.125"
     networks:
       - hugegraph-network
     environment:
@@ -24,7 +29,7 @@ services:
 
   # HugeGraph LLM RAG Service
   hugegraph-rag:
-    image: hugegraph/rag
+    image: hugegraph/rag:1.7.0-fixed-arm
     container_name: rag
     restart: unless-stopped
     ports:
